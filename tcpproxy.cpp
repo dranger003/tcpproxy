@@ -18,7 +18,6 @@ typedef struct _LISTENSTATE
 typedef struct _ACCEPTSTATE
 {
     SOCKET hAccept;
-    HANDLE hEvent;
     USHORT usDstPort;
     LPCTSTR pszDstHost;
 } ACCEPTSTATE, *PACCEPTSTATE;
@@ -28,7 +27,9 @@ class CTaskMgr;
 class ITask
 {
 public:
-    virtual void Run(CTaskMgr *pMgr, PVOID pv) = 0;
+    virtual LPCTSTR GetType() = 0;
+    virtual void Execute(CTaskMgr *pTaskMgr, PVOID pv) = 0;
+    virtual void Terminate() = 0;
 };
 
 class CTaskMgr
@@ -36,43 +37,93 @@ class CTaskMgr
 public:
     typedef ITask * RequestType;
 
-    CTaskMgr() :
-        _hEvent(CreateEvent(NULL, TRUE, FALSE, NULL))
-    { }
+    CTaskMgr()
+    {
+        HRESULT hr = _cs.Init();
+        _ASSERT(SUCCEEDED(hr));
+    }
 
+    virtual ~CTaskMgr()
+    {
+        HRESULT hr = _cs.Term();
+        _ASSERT(SUCCEEDED(hr));
+    }
+
+    // Pool -> Threads
     BOOL Initialize(PVOID pv) throw() { return TRUE; }
+    void Terminate(PVOID pv) throw() { }
 
-    void Execute(RequestType request, PVOID pv, LPOVERLAPPED pOvl)
+    // Thread -> Tasks
+    void Execute(ITask *pTask, PVOID pv, LPOVERLAPPED pOvl)
     {
-        InterlockedIncrement(&_dwCount);
-        request->Run(this, pv);
-        InterlockedDecrement(&_dwCount);
+        SIZE_T nIndex = 0;
+
+        if (!_tcscmp(pTask->GetType(), _T("CAcceptTask")))
+        {
+            {
+                CComCritSecLock<CComCriticalSection> lock(_cs, false);
+                HRESULT hr = lock.Lock();
+                _ASSERT(SUCCEEDED(hr));
+
+                nIndex = _AcceptTasks.Add(pTask);
+            }
+
+            pTask->Execute(this, pv);
+
+            {
+                CComCritSecLock<CComCriticalSection> lock(_cs, false);
+                HRESULT hr = lock.Lock();
+                _ASSERT(SUCCEEDED(hr));
+
+                _AcceptTasks.RemoveAt(nIndex);
+            }
+        }
+        else
+        {
+            pTask->Execute(this, pv);
+        }
     }
 
-    void Terminate(PVOID pv) throw()
+    void TerminateAcceptTasks()
     {
-        SetEvent(_hEvent);
-        CloseHandle(_hEvent);
-    }
+        CComCritSecLock<CComCriticalSection> lock(_cs, false);
+        HRESULT hr = lock.Lock();
+        _ASSERT(SUCCEEDED(hr));
 
-    DWORD GetCount() { return _dwCount; }
-    HANDLE GetWaitHandle() { return _hEvent; }
+        for (SIZE_T i = 0; i < _AcceptTasks.GetCount(); i++)
+            _AcceptTasks[i]->Terminate();
+    }
 
 private:
-    static DWORD _dwCount;
-    HANDLE _hEvent;
+    CComCriticalSection _cs;
+    static CAtlArray<ITask *> _AcceptTasks;
 };
 
-DWORD CTaskMgr::_dwCount = 0;
+CAtlArray<ITask *> CTaskMgr::_AcceptTasks;
 
 class CAcceptTask : public ITask
 {
 public:
     CAcceptTask(PVOID pv) :
-        _pv(pv)
-    { }
+        _pv(pv),
+        _hEvent(NULL)
+    {
+        _hEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
+        _ASSERT(_hEvent);
+    }
 
-    void Run(CTaskMgr *pMgr, PVOID pv)
+    virtual ~CAcceptTask()
+    {
+        CloseHandle(_hEvent);
+    }
+
+    LPCTSTR GetType()
+    {
+        static const _TCHAR szType[] = _T("CAcceptTask");
+        return szType;
+    }
+
+    void Execute(CTaskMgr *pTaskMgr, PVOID pv)
     {
         DBG1(_T("CAcceptTask::Run()"), _T("IN"));
 
@@ -92,20 +143,21 @@ public:
             InetPton(AF_INET, pState->pszDstHost, &client.sin_addr);
 
             dwRes = WSAConnect(hConnect, (PSOCKADDR)&client, sizeof(client), NULL, NULL, (LPQOS)NULL, (LPQOS)NULL);
-            _tprintf(_T("WSAGetLastError() = %ld\n"), WSAGetLastError());
             _ASSERT(dwRes != SOCKET_ERROR);
 
             DBG1(_T("WSAConnect()"), _T("%s:%d"), pState->pszDstHost, pState->usDstPort);
 
             {
+                DWORD dwRes = 0;
+
                 CHAR bytes[65536] = { 0 };
                 WSABUF buf;
                 buf.buf = &bytes[0];
                 DWORD rcb = 0, scb = 0, dwFlags = 0;
-                HANDLE hEvents[] = { pState->hEvent, WSACreateEvent(), WSACreateEvent() };
+                HANDLE hEvents[] = { _hEvent, WSACreateEvent(), WSACreateEvent() };
                 WSANETWORKEVENTS wne = { 0 };
 
-                DWORD dwRes = WSAEventSelect(pState->hAccept, hEvents[1], FD_READ | FD_CLOSE);
+                dwRes = WSAEventSelect(pState->hAccept, hEvents[1], FD_READ | FD_CLOSE);
                 _ASSERT(dwRes != SOCKET_ERROR);
 
                 dwRes = WSAEventSelect(hConnect, hEvents[2], FD_READ | FD_CLOSE);
@@ -152,14 +204,13 @@ public:
                         break;
                 }
 
+                WSACloseEvent(hEvents[2]);
                 WSACloseEvent(hEvents[1]);
             }
 
             WSAShutdown(hConnect, SD_BOTH);
             WSACloseSocket(hConnect);
         }
-
-        WSACloseEvent(pState->hEvent);
 
         WSAShutdown(pState->hAccept, SD_BOTH);
         WSACloseSocket(pState->hAccept);
@@ -169,8 +220,11 @@ public:
         DBG1(_T("CAcceptTask::Run()"), _T("OUT"));
     }
 
+    void Terminate() { SetEvent(_hEvent); }
+
 private:
     PVOID _pv;
+    HANDLE _hEvent;
 };
 
 class CListenTask : public ITask
@@ -180,7 +234,13 @@ public:
         _pv(pv)
     { }
 
-    void Run(CTaskMgr *pMgr, PVOID pv)
+    LPCTSTR GetType()
+    {
+        static const _TCHAR szType[] = _T("CListenTask");
+        return szType;
+    }
+
+    void Execute(CTaskMgr *pTaskMgr, PVOID pv)
     {
         DBG1(_T("CListenTask::Run()"), _T("IN"));
 
@@ -206,11 +266,11 @@ public:
 
         DBG1(_T("WSAListen()"), _T("127.0.0.1:%d"), pState->usSrcPort);
 
-        HANDLE hEvent = WSACreateEvent();
-        dwRes = WSAEventSelect(hListen, hEvent, FD_ACCEPT);
-        _ASSERT(dwRes != SOCKET_ERROR);
+        HANDLE hEvents[] = { pState->hEvent, WSACreateEvent() };
+        WSANETWORKEVENTS wne = { 0 };
 
-        HANDLE hEvents[] = { pState->hEvent, hEvent };
+        dwRes = WSAEventSelect(hListen, hEvents[1], FD_ACCEPT);
+        _ASSERT(dwRes != SOCKET_ERROR);
 
         while (TRUE)
         {
@@ -220,8 +280,7 @@ public:
 
             _ASSERT(dwRes == WSA_WAIT_EVENT_0 + 1);
 
-            WSANETWORKEVENTS wne = { 0 };
-            dwRes = WSAEnumNetworkEvents(hListen, hEvent, &wne);
+            dwRes = WSAEnumNetworkEvents(hListen, hEvents[1], &wne);
             _ASSERT(dwRes != SOCKET_ERROR);
 
             if (wne.lNetworkEvents & FD_ACCEPT)
@@ -243,7 +302,6 @@ public:
                 {
                     PACCEPTSTATE pAcceptState = new ACCEPTSTATE;
                     pAcceptState->hAccept = hAccept;
-                    pAcceptState->hEvent = WSACreateEvent();
                     pAcceptState->pszDstHost = pState->pszDstHost;
                     pAcceptState->usDstPort = pState->usDstPort;
                     pPool->QueueRequest(new CAcceptTask(pAcceptState));
@@ -251,13 +309,17 @@ public:
             }
         }
 
-        WSACloseEvent(hEvent);
+        pTaskMgr->TerminateAcceptTasks();
+
+        WSACloseEvent(hEvents[1]);
 
         WSAShutdown(hListen, SD_BOTH);
         WSACloseSocket(hListen);
 
         DBG1(_T("CListenTask::Run()"), _T("OUT"));
     }
+
+    void Terminate() { }
 
 private:
     PVOID _pv;
