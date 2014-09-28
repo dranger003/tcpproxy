@@ -18,7 +18,6 @@
 
 // TODO: reference additional headers your program requires here
 #include <atlcoll.h>
-#include <atlutil.h>
 #include <WS2tcpip.h>
 #include <conio.h>
 
@@ -47,7 +46,7 @@
                                     (f)                                                                             \
                                 );                                                                                  \
                                 fflush(stdout);                                                                     \
-                            }
+                                                        }
 #define DBG0(f)             _DBG((f))                                                                               \
                             _tprintf(_T("\n"));                                                                     \
                             fflush(stdout)
